@@ -13,3 +13,6 @@ audience should be familiar with lwa observations
 - package dependancies
 
 look at lsl read me
+
+
+### from UNM REU project 2026
