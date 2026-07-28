@@ -1,6 +1,6 @@
 # pipeline.py
 """
-Full pipeline: 
+Full pipeline first half: 
 1. Build metadata CSVs from tarballs(temporarily saved unless otherwise specified)
 2. Finds corresponding raw data files for each of the tarballs (one per station)
 3. Run upchannlize on each station's data
