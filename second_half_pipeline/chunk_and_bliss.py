@@ -10,7 +10,7 @@ import os
 import glob
 import argparse
 
-BLISS_DIR = '/home/ctaylor/bliss/build/bliss' # On LWAUCF3
+BLISS_DIR = '/home/ctaylor/bliss/build/bliss' # Note: this directory is on LWAUCF3. Change this variable to a different location if bliss is installed elsewhere
 
 def make_overlapping_channel_chunks(nchan, chunk_size, min_overlap=2048):
     """
