@@ -1,7 +1,8 @@
-# LWA-swarm-SETI
-Updated project to conduct SETI searches using observations with the LWA Swarm
+# LoFreq-SETI
+Project to conduct SETI searches using observations with the LWA Swarm.
 
 ## 1 paragraph description of the project
+
 
 ## flowchart
 
@@ -15,4 +16,4 @@ audience should be familiar with lwa observations
 look at lsl read me
 
 
-### from UNM REU project 2026
+### Built for UNM REU project 2026
