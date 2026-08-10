@@ -52,11 +52,6 @@ run_upchannelize(
 # --avg 3.0 \
 # --length 8388608
 
-
-# python3 -m final_scripts.pipeline --tar-path '/data/network/recent_data/savin/alltar/DD002_8034.tgz' --drx-path '/data/network/recent_data/savin/drx_seti/059638_002859665' --avg 3.0 --length 8388608
-
-# python3 -m final_scripts.pipeline --tar-path '/data/network/recent_data/savin/alltar/DD002_8051.tgz' --drx-path '/data/network/recent_data/savin/drx_seti/059659_003099308' --avg 3.0 --length 8388608 --station lwa1
-
 # within legacy lsl venv: source .venv-legacy-lsl/bin/activate
 # export LWA_STATION_OVERRIDE=lwa1
 # python3 -m final_scripts.pipeline --tar-path '/data/network/recent_data/savin/alltar/DD002_8061.tgz' --drx-path '/data/network/recent_data/savin/drx_seti' --avg 3.0 --length 8388608 --station lwa1
@@ -69,10 +64,3 @@ run_upchannelize(
 # --avg 3.0 \
 # --length 8388608 \
 # --meta-dir '/data/local/lekness/scripts_lillian/'
-
-
-
-# additional changes: 
-# add naming conventions for phase cal/flux cal/target to tuning files? 
-    # or rename to be more like the original tarball name, e.g. DT006_260605_0600_0001_LWA1_tun1.h5
-# take out the get_metadata step since we can get the metadata straight from the tarball
