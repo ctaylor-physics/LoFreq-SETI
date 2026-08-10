@@ -14,7 +14,7 @@ The left column is the first half of the pipeline and the right column is the se
 Each half of the pipeline requires a command line call. The first call will produce 2 tuning files for each stations' observations. This call requires a path to the tarballs and the raw data files, along with resolution preferences for the time and frequency channelizations. For high frequency resolution (which is necessary for technosignature searches), use an averaging length of 3.0 s and an FFT length of 8388608. These variables are adjustable, therefore changes can be made for coarser frequency resolution if a shorter processing time is desired, for example. 
 
 First call: \
- run like this for all stations on the same date (e.g. DT006_260605_0600_0001):\
+ run like this for all stations on the same date (e.g. DT006_260605_0600_0001): \
  python3 pipeline.py \
  --tar-path '/data/network/recent_data/lekness/DT006_260605_0600_0001/DT006_*.tgz' \ 
  --drx-path '/data/network/recent_data/lekness/DT006_260605_0600_0001/' \
