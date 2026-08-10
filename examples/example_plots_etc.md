@@ -11,6 +11,7 @@ These plots are created at the end of the second call, depending on how many inp
 <img width="1726" height="1260" alt="image" src="https://github.com/user-attachments/assets/f0715d5b-6410-45d2-a9fe-18f53b0b9df1" />
 
 ## Ideal Technosignatures
+Technosignatures should be narrowband with a constant drift rate across long and short observations. Wide-band and inconsistent drift rates are not characteristic of technosignatures and are usually attributed to radio frequency interference (RFI). The first image is an artificial technosignature used for testing and the second is a technosignature detected from the Voyager 1 telescope. 
 
 <img width="1199" height="723" alt="image" src="https://github.com/user-attachments/assets/79278d34-9baa-4c14-92c6-67743b5a1630" />
 
