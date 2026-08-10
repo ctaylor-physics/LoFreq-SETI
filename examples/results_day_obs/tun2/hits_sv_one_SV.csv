@@ -1,0 +1,4 @@
+index,Drift_Rate,SNR,Uncorrected_Frequency,Corrected_Frequency,Index,freq_start,freq_end,SEFD_freq,Coarse_Channel_Number,channel two,Full_number_of_hits
+0,-0.02943,14.964956,67.236502,67.236502,200639,67.236509,67.236495,0.0,0.0,0,2
+1,-0.02943,186.219589,67.242483,67.242483,203199,67.24249,67.242476,0.0,0.0,0,4
+2,-0.044145,32.218594,67.218556,67.218556,192960,67.218567,67.218546,0.0,0.0,0,3
