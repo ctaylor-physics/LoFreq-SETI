@@ -18,8 +18,18 @@ The second call will create a bandpass profile for each tuning file, then chunk 
 ## Usage on older data
 While this codebase has been tested on both old and new data, it was created primarily for usage on new data from the LWA. For archival data, patches must be made. Particularly, the lsl package must run on a different version for older data, so a virtual environment should be created. The details of the virtual environment are listed in ".venv-legacy-lsl". This virtual environment was created specifically for data recorded in 2022 using an lsl version of 3.0.8. Additional or fewer patches may be necessary for archival data of a different era. 
 
-### Package Dependencies
-
+## Package Dependencies
+The requirements for this codebase are the same as those for the lsl package:
+python >= 3.8
+C++ compiler with at least C++11 support
+fftw3 >= 3.2 (single precision version)
+gsl >= 2.4
+gdbm >= 1.8
+numpy >= 1.7
+scipy >= 0.19
+astropy >= 5.2
+pyephem >= 3.7.5.3
+aipy >= 3.0.1
 
 
 ### This pipeline was built for UNM REU project 2026
