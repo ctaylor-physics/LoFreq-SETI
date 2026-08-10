@@ -10,14 +10,16 @@ The pipeline is split into two sections.
 The left column is the first half of the pipeline and the right column is the second half. After the first half, there is a break for potential inspection and reorganizing of the data if necessary. The second half of the pipeline is called separately. This provides freedom for comparing multiple station data in case one station did not have adequate tuning file quality. 
 
 
-## use instructions
-audience should be familiar with lwa observations
-- preserve raw data for this pipeline
+## Instructions
+Each half of the pipeline requires a command line call. The first call will produce 2 tuning files for each stations' observations. This call requires a path to the tarballs and the raw data files, along with resolution preferences for the time and frequency channelizations. For high frequency resolution (which is necessary for technosignature searches), use an averaging length of 3.0 s and an FFT length of 8388608. These variables are adjustable, therefore changes can be made for coarser frequency resolution if a shorter processing time is desired, for example. 
 
-# potentially: 
-- package dependancies
+The second call will create a bandpass profile for each tuning file, then chunk and run BLISS, and then plot cross-check across multiple stations, and finally plot "stamps" of each hit matched at multiple stations. This call must include the direct paths to each of the tuning files (up to 4 or 6), along with chosen tolerances for the anti-coincidence test between frequency and drift-rates. The defaults are 10 Hz across and 0.8 Hz/s. These tolerances produce an average of 1 hit matched between two stations per observation. Other arguments can be tweaked, such as the stamp width (number of frequency channels around the hit), chunk size (cut of tuning file that runs through bliss), min_overlap (overlap across chunks that run through bliss), and output directory. This call first looks if there is already an existing bandpass profile for each tuning file, this way re-runs don't have to produce another as the bandpass generation takes ~10 minutes per tuning file. 
 
-look at lsl read me
+## Usage on older data
+While this codebase has been tested on both old and new data, it was created primarily for usage on new data from the LWA. For archival data, patches must be made. Particularly, the lsl package must run on a different version for older data, so a virtual environment should be created. The details of the virtual environment are listed in ".venv-legacy-lsl". This virtual environment was created specifically for data recorded in 2022 using an lsl version of 3.0.8. Additional or fewer patches may be necessary for archival data of a different era. 
+
+### Package Dependencies
+
 
 
 ### This pipeline was built for UNM REU project 2026
