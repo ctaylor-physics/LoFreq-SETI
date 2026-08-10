@@ -15,19 +15,19 @@ Each half of the pipeline requires a command line call. The first call will prod
 
 First call example: \
  (run like this for all stations on the same date (e.g. DT006_260605_0600_0001)): \
- python3 first_half_pipeline/pipeline.py \
+ `python3 first_half_pipeline/pipeline.py \
  --tar-path '/data/network/recent_data/lekness/DT006_260605_0600_0001/DT006_*.tgz' \ 
  --drx-path '/data/network/recent_data/lekness/DT006_260605_0600_0001/' \
  --avg 3.0 \
- --length 8388608
+ --length 8388608`
 
 The second call will create a bandpass profile for each tuning file, then chunk and run BLISS, and then plot cross-check across multiple stations, and finally plot "stamps" of each hit matched at multiple stations. This call must include the direct paths to each of the tuning files (up to 4 or 6), along with chosen tolerances for the anti-coincidence test between frequency and drift-rates. The defaults are 10 Hz across and 0.8 Hz/s. These tolerances produce an average of 1 hit matched between two stations per observation. Other arguments can be tweaked, such as the stamp width (number of frequency channels around the hit), chunk size (cut of tuning file that runs through bliss), min_overlap (overlap across chunks that run through bliss), and output directory. This call first looks if there is already an existing bandpass profile for each tuning file, this way re-runs don't have to produce another as the bandpass generation takes ~10 minutes per tuning file. 
 
 Second call example: \
- python3 second_half_pipeline/run_pipeline.py \
+ `python3 second_half_pipeline/run_pipeline.py \
      frb_set_two/059613_002172869-LWA-SV_tun1.h5 frb_set_two/059613_002172869-LWA-SV_tun2.h5 \
      frb_set_two/059613_002567249-LWA1_tun1.h5   frb_set_two/059613_002567249-LWA1_tun1.h5 \
-     --freq_tol 10 --drift_tol 0.8 --width 524 --outdir results_frb_set_three
+     --freq_tol 10 --drift_tol 0.8 --width 524 --outdir results_frb_set_three`
 
 ## Usage on older data
 While this codebase has been tested on both old and new data, it was created primarily for usage on new data from the LWA. For archival data, patches must be made. Particularly, the lsl package must run on a different version for older data, so a virtual environment should be created. The details of the virtual environment are listed in "venv-legacy-lsl.md". This virtual environment was created specifically for data recorded in 2022 using an lsl version of 3.0.8. Additional or fewer patches may be necessary for archival data of a different era. 
