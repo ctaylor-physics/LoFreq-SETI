@@ -20,16 +20,12 @@ While this codebase has been tested on both old and new data, it was created pri
 
 ## Package Dependencies
 The requirements for this codebase are the same as those for the lsl package:
-python >= 3.8
-C++ compiler with at least C++11 support
-fftw3 >= 3.2 (single precision version)
-gsl >= 2.4
-gdbm >= 1.8
-numpy >= 1.7
-scipy >= 0.19
-astropy >= 5.2
-pyephem >= 3.7.5.3
-aipy >= 3.0.1
+- python >= 3.8
+- numpy >= 1.7
+- scipy >= 0.19
+- astropy >= 5.2
+- pyephem >= 3.7.5.3
+- aipy >= 3.0.1
 
 
 ### This pipeline was built for UNM REU project 2026
