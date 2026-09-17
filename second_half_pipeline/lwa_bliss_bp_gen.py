@@ -1,55 +1,37 @@
+"""Fit and apply a bandpass on the valid interior of a full-grid LWA tuning.
+
+The final smoothed float32 profile is stored in ``bandpass_model`` and exported
+unchanged to ``<basename>_bpmodel.f32``. Original data become ``uncorrected``;
+flattened data become ``data``. Excluded edges stay -1.0 and the mask is retained.
+The old chunk-and-BLISS runner must not be used on these already corrected files.
 """
-lwa_bliss_bp_gen.py
-
-Stage 1 of the LWA coincidence-search pipeline (see run_pipeline.py).
-
-Given a single LWA waterfall .h5 file, this script:
-    1. Computes an *instrumental* bandpass model from the station's known
-       hardware response (antenna impedance mismatch, ARX filter response,
-       and DRX filter response) — this captures the shape imposed by the
-       receiver hardware itself, independent of the data.
-    2. Divides that instrumental shape out of a handful of sample rows from
-       the data, then fits a smooth (Savitzky-Golay) curve to what's left.
-       That residual is the leftover "PFB ripple" — a periodic ripple
-       pattern introduced by the polyphase filter bank used to channelize
-       the data. Combines it with the instrumental model to get one
-       complete bandpass model, which is saved into the .h5 file (as
-       'bandpass_model') and used to write a bandpass-corrected copy of the
-       data (as 'corrected') back into the same file.
-    3. Smooths that combined bandpass model once more and writes it out as
-       a standalone flat binary float32 file: '<basename>_bpmodel.f32'.
-       This .f32 file is the only thing run_pipeline.py consumes from this
-       script — it gets passed as --bp to chunk_and_bliss.py downstream.
-
-Usage
------
-    python lwa_bliss_bp_gen.py path/to/data.h5
-
-Produces (in the current working directory):
-    <basename>_bpmodel.f32
-"""
-
-import sys
+import argparse
 import os
-import numpy as np
+import operator
+
 import h5py
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.signal import savgol_filter
 
 from lsl.common import stations, ndp
 from lsl.reader.drx import FILTER_CODES
 
-from scipy.interpolate import interp1d
-from scipy.signal import savgol_filter
-
-# CuPy is optional — if it's installed, the chunked correction pass in
-# computeBandpassData_streaming() runs on GPU. If not, we fall back to
-# plain NumPy (slower, but functionally identical).
 try:
     import cupy as cp
-    GPU_AVAILABLE = True
-    print("CuPy found — GPU acceleration enabled")
 except ImportError:
-    GPU_AVAILABLE = False
-    print("CuPy not found — falling back to CPU")
+    cp = None
+
+
+def array_backend():
+    """Use CuPy when a device is accessible, otherwise keep processing on CPU."""
+    if cp is not None:
+        try:
+            if cp.cuda.runtime.getDeviceCount() > 0:
+                return cp
+        except cp.cuda.runtime.CUDARuntimeError:
+            pass
+    return np
 
 
 # ── instrumental bandpass (hardware-derived, not fit from data) ────────────
@@ -123,251 +105,301 @@ def compute_bandpass_instrumental(freq):
     return bpm
 
 
-# ── smoothing helper ────────────────────────────────────────────────────────
-
-def smooth_bpmodel(bpmodel, od=9, ws_min=41):
-    """
-    Apply a Savitzky-Golay smoothing pass to a 1-D bandpass model and
-    renormalize it to a mean of 1. `ws_min` is accepted for API
-    compatibility but the window width is actually derived from
-    sqrt(len(bpmodel)) below (matching the original behavior).
-    """
-    ws = int(round(np.sqrt(len(bpmodel))))
-    if ws % 2 == 0:
-        ws += 1
-
-    bpm = savgol_filter(bpmodel, ws, od, deriv=0)
-    bpm = np.ma.array(bpm, mask=~np.isfinite(bpm))
-
-    if bpm.mean() == 0:
-        bpm += 1
-    bpm = bpm / bpm.mean()
-    return bpm
+# Only this group is owned by an in-progress correction. It holds hard links
+# during promotion, so an interrupted dataset rename never loses the raw input.
+WORK_GROUP = '_bandpass_work'
+CORRECTION_VERSION = 1
+LAYOUT_KEYS = ('coarse_layout_version', 'num_coarse', 'edge_coarse',
+               'fine_channels_per_coarse', 'valid_channel_start', 'valid_channel_stop',
+               'edge_mask_value')
 
 
-# ── residual PFB-ripple fit + in-place HDF5 correction ─────────────────────
+def read_layout(ds, mask):
+    """Validate the first-half metadata without inferring or changing a layout."""
+    if ds.ndim != 3 or ds.shape[1] != 1 or ds.shape[0] == 0 or ds.shape[2] < 2:
+        raise ValueError('Expected nonempty tuning data with shape (time, 1, frequency)')
+    missing = [key for key in LAYOUT_KEYS + ('nchans', 'fch1', 'foff') if key not in ds.attrs]
+    if missing:
+        raise ValueError(f'Missing full-grid metadata: {missing}; regenerate with the updated first half')
+    values = {}
+    for key in LAYOUT_KEYS[:-1] + ('nchans',):
+        try:
+            values[key] = operator.index(ds.attrs[key])
+        except TypeError as exc:
+            raise ValueError(f'{key} must be an integer') from exc
+    n = ds.shape[2]
+    coarse, edge = values['num_coarse'], values['edge_coarse']
+    if values['coarse_layout_version'] != 1 or values['nchans'] != n:
+        raise ValueError('Unsupported layout version or nchans does not match the dataset')
+    if coarse <= 0 or edge < 0 or 2 * edge >= coarse or n % coarse:
+        raise ValueError('Invalid coarse-channel count, divisibility, or edge exclusion')
+    width = n // coarse
+    start, stop = edge * width, n - edge * width
+    if (values['fine_channels_per_coarse'], values['valid_channel_start'],
+            values['valid_channel_stop']) != (width, start, stop):
+        raise ValueError('Stored coarse-channel layout is inconsistent')
+    if ds.attrs['edge_mask_value'] != -1.0:
+        raise ValueError('Expected edge_mask_value = -1.0')
+    if not np.isfinite(ds.attrs['fch1']) or not np.isfinite(ds.attrs['foff']) or ds.attrs['foff'] == 0:
+        raise ValueError('Frequency origin and spacing must be finite, with nonzero spacing')
+    if mask.shape != ds.shape or mask.dtype != np.dtype('uint8'):
+        raise ValueError('Expected a uint8 mask with the same shape as data')
+    return start, stop
+
+
+def positive_profile(profile, label):
+    profile = np.asarray(profile, dtype=np.float64)
+    if profile.ndim != 1 or not np.all(np.isfinite(profile)) or np.any(profile <= 0):
+        raise ValueError(f'{label} must be finite and positive throughout the valid interval')
+    return profile
+
+
+def smoothing_parameters(size, window, order):
+    if size < 1 or window < 1 or order < 0:
+        raise ValueError('Smoothing needs a nonempty interval, positive window, and nonnegative order')
+    window = min(int(window), size)
+    if window % 2 == 0:
+        window -= 1
+    return window, min(order, window - 1)
+
+
+def smooth_bpmodel(bpmodel, od=4, window_size=None):
+    """Final smoothing of the valid interval only; return a mean-one profile."""
+    profile = positive_profile(bpmodel, 'Combined bandpass')
+    requested = window_size if window_size is not None else (int(round(np.sqrt(profile.size))) | 1)
+    window, order = smoothing_parameters(profile.size, requested, od)
+    result = positive_profile(savgol_filter(profile, window, order), 'Smoothed bandpass')
+    return result / result.mean()
+
+
+def _promote(f):
+    """Idempotently finish a validated correction using staged hard links."""
+    work = f[WORK_GROUP]
+    if work.attrs.get('state') != 'ready':
+        raise ValueError('Incomplete bandpass correction; rerun with --force to restart from raw data')
+    raw, corrected, model = work['raw'], work['corrected'], work['bandpass_model']
+    start, stop = read_layout(raw, f['mask'])
+    read_layout(corrected, f['mask'])
+    if corrected.shape != raw.shape or model.shape != (raw.shape[2],):
+        raise ValueError('Staged bandpass output has inconsistent shapes')
+    if corrected.attrs.get('bandpass_correction_version') != CORRECTION_VERSION:
+        raise ValueError('Staged corrected data are not marked complete')
+    positive_profile(model[start:stop], 'Staged bandpass')
+    if 'uncorrected' in f and f['uncorrected'].id != raw.id:
+        raise ValueError('Existing uncorrected data do not match the staged source')
+    if 'uncorrected' not in f:
+        f['uncorrected'] = raw
+    for name, dataset in (('data', corrected), ('bandpass_model', model)):
+        if name in f and f[name].id == dataset.id:
+            continue
+        if name in f:
+            del f[name]
+        f[name] = dataset
+    f.flush()
+    del f[WORK_GROUP]
+    f.flush()
+
+
+def _source(f, force):
+    if WORK_GROUP in f:
+        if f[WORK_GROUP].attrs.get('state') == 'ready':
+            _promote(f)
+        elif not force:
+            raise ValueError('Incomplete bandpass correction; rerun with --force to restart from raw data')
+        else:
+            # A writing-stage failure has not changed the public datasets.
+            work = f[WORK_GROUP]
+            if work.attrs.get('state') != 'writing':
+                raise ValueError('Unknown bandpass work state; refusing to discard it')
+            source = f.get('uncorrected', f.get('data'))
+            if source is None or ('raw' in work and source.id != work['raw'].id):
+                raise ValueError('Cannot safely restart: original data are not available')
+            del f[WORK_GROUP]
+    if 'corrected' in f:
+        raise ValueError('Legacy corrected dataset found; use a fresh full-grid first-half file')
+    if 'data' not in f or 'mask' not in f:
+        raise ValueError('Expected data and mask datasets')
+    complete = f['data'].attrs.get('bandpass_correction_version')
+    if complete is not None:
+        if complete != CORRECTION_VERSION or 'uncorrected' not in f or 'bandpass_model' not in f:
+            raise ValueError('Unrecognized or incomplete bandpass correction')
+        ds = f['uncorrected']
+        start, stop = read_layout(ds, f['mask'])
+        if read_layout(f['data'], f['mask']) != (start, stop) or f['data'].shape != ds.shape:
+            raise ValueError('Corrected and original layouts do not match')
+        model = f['bandpass_model']
+        if model.shape != (ds.shape[2],) or model.attrs.get('bandpass_correction_version') != CORRECTION_VERSION:
+            raise ValueError('Invalid saved bandpass model')
+        if not force:
+            positive_profile(model[start:stop], 'Saved bandpass')
+            print('Bandpass correction already complete; reusing the saved profile')
+            return None
+        return ds
+    if 'uncorrected' in f or 'bandpass_model' in f:
+        raise ValueError('Ambiguous previous correction; use a fresh full-grid first-half file')
+    return f['data']
+
+
+def _correct_blocks(ds, mask, out, profile, start, stop, rows_per_block, channel_block, xp=np):
+    """Check mask/sentinels and correct in bounded time-frequency blocks."""
+    for row in range(0, ds.shape[0], rows_per_block):
+        end = min(row + rows_per_block, ds.shape[0])
+        for left, right, valid in ((0, start, False), (start, stop, True),
+                                   (stop, ds.shape[2], False)):
+            for col in range(left, right, channel_block):
+                last = min(col + channel_block, right)
+                selection = np.s_[row:end, 0, col:last]
+                flags = mask[selection]
+                if np.any(flags != (0 if valid else 1)):
+                    raise ValueError('Mask does not match the stored valid-channel interval')
+                data = ds[selection]
+                if not valid:
+                    if np.any(data != -1.0):
+                        raise ValueError('Excluded edge samples must equal -1.0')
+                    continue  # The output fill value is -1.0.
+                if not np.all(np.isfinite(data)):
+                    raise ValueError('Nonfinite data in the valid interval')
+                with np.errstate(over='ignore', invalid='ignore'):
+                    corrected = (xp.asarray(data, dtype=xp.float64) /
+                                 xp.asarray(profile[col:last])).astype(xp.float32)
+                    if xp is not np:
+                        corrected = xp.asnumpy(corrected)
+                if not np.all(np.isfinite(corrected)):
+                    raise ValueError('Bandpass correction produced nonfinite float32 values')
+                out[selection] = corrected
+        print(f'Corrected rows {end}/{ds.shape[0]}')
+
 
 def computeBandpassData_streaming(
-    hdf5_path,
-    input_dataset,
-    output_dataset="corrected",
-    bpm_dataset="bandpass_model",
-    chunk_size=16,
-    bpm_estimation_chunks=32,
-    instr_bandpass=None,
-    window_size=41,
+    hdf5_path, input_dataset='data', output_dataset='corrected',
+    bpm_dataset='bandpass_model', chunk_size=16, bpm_estimation_chunks=32,
+    instr_bandpass=None, window_size=41, *, force=False, channel_block=131072,
+    final_window=None, use_instrumental=False,
 ):
+    """Apply the final smoothed profile and promote the result, preserving raw data.
+
+    Input/output names are retained for existing callers, but the public schema
+    is fixed. Forced refits always use uncorrected, never the flattened data.
+    An optional supplied instrumental model is full-length; only its interior
+    is used. Otherwise use_instrumental computes the LSL model on that interior.
     """
-    Streaming PFB-ripple correction for a large HDF5 spectral dataset.
-
-    Pass 1: sample a handful of rows spread evenly across the file, divide
-    out the instrumental bandpass (if given), take the median across those
-    rows, and fit a Savitzky-Golay curve to what's left. That's the
-    "residual ripple" — the PFB channelizer's periodic gain wobble that
-    the instrumental model doesn't already account for.
-
-    The residual ripple is combined with the instrumental model into one
-    normalized `combined_bpm`, which is written to the file as a 1-D
-    dataset (`bpm_dataset`).
-
-    Pass 2: stream through the file in chunks, divide every row by
-    `combined_bpm`, and write the corrected data to `output_dataset`.
-
-    Returns
-    -------
-    combined_bpm : np.ndarray, shape [F]
-        The full normalized bandpass model applied to the data.
-    """
-    xp = cp if GPU_AVAILABLE else np
-
-    with h5py.File(hdf5_path, "a") as f:
-        ds = f[input_dataset]
-        raw_shape = ds.shape
-        dtype = ds.dtype
-
-        if ds.ndim == 3:
-            N, _, F = raw_shape
-            squeeze = True
-        elif ds.ndim == 2:
-            N, F = raw_shape
-            squeeze = False
-        else:
-            raise ValueError(f"Expected 2-D or 3-D dataset, got shape {raw_shape}")
-
-        print(f"Dataset  : {input_dataset}  {raw_shape}  ({dtype})")
-        print(f"Rows N={N}, Channels F={F}")
-        print(f"Backend  : {'GPU (CuPy)' if GPU_AVAILABLE else 'CPU (NumPy)'}")
-
-        # Instrumental model must match the data's channel count. Normalize
-        # to a mean of 1 so it only reshapes the spectrum, doesn't rescale it.
+    if (input_dataset, output_dataset, bpm_dataset) != ('data', 'corrected', 'bandpass_model'):
+        raise ValueError('Expected dataset names data, corrected, and bandpass_model')
+    if min(chunk_size, bpm_estimation_chunks, channel_block, window_size) < 1:
+        raise ValueError('Block sizes, estimation-row count, and smoothing window must be positive')
+    if final_window is not None and final_window < 1:
+        raise ValueError('Final smoothing window must be positive')
+    with h5py.File(hdf5_path, 'r+') as f:
+        ds = _source(f, force)
+        if ds is None:
+            return f['bandpass_model'][:]
+        start, stop = read_layout(ds, f['mask'])
+        nrows, _, nchans = ds.shape
+        size = stop - start
+        xp = array_backend()
+        print(f'Backend: {"CPU" if xp is np else "GPU"}')
+        print(f'Fitting valid fine channels [{start}, {stop}) of {nchans}')
+        instrument = None
         if instr_bandpass is not None:
-            instr_bandpass = np.asarray(instr_bandpass, dtype=np.float64)
-            if instr_bandpass.shape != (F,):
-                raise ValueError(
-                    f"instr_bandpass shape {instr_bandpass.shape} does not "
-                    f"match channel axis F={F}"
-                )
-            instr_bandpass = instr_bandpass / instr_bandpass.mean()
-            print(f"Instr. bandpass provided  |  "
-                  f"min={instr_bandpass.min():.4f}  max={instr_bandpass.max():.4f}")
-        else:
-            print("Instr. bandpass          : None (fitting raw spectrum)")
+            supplied = np.asarray(instr_bandpass)
+            if supplied.shape != (nchans,):
+                raise ValueError('Instrumental bandpass must match the full fine-channel count')
+            instrument = supplied[start:stop]
+        elif use_instrumental:
+            freqs = ds.attrs['fch1'] + ds.attrs['foff'] * np.arange(start, stop)
+            instrument = compute_bandpass_instrumental(freqs * 1e6)
+        if instrument is not None:
+            instrument = positive_profile(instrument, 'Instrumental bandpass')
+            if instrument.shape != (size,):
+                raise ValueError('Instrumental response does not match the valid interval')
+            # Do not subtract the minimum: a response floor near zero can amplify
+            # data arbitrarily. Fail clearly for invalid/unsupported responses.
+            instrument = instrument / instrument.mean()
 
-        # ── PASS 1: estimate residual PFB ripple from a handful of rows ──
-        sample_idx = np.linspace(0, N - 1, min(bpm_estimation_chunks, N), dtype=int)
-        row_medians = np.empty((len(sample_idx), F), dtype=np.float64)
+        sample_idx = np.linspace(0, nrows - 1, min(bpm_estimation_chunks, nrows), dtype=int)
+        median = np.empty(size, dtype=np.float64)
+        for offset in range(0, size, channel_block):
+            end = min(offset + channel_block, size)
+            samples = np.empty((len(sample_idx), end - offset), dtype=np.float64)
+            for i, row in enumerate(sample_idx):
+                samples[i] = ds[row, 0, start + offset:start + end]
+            if not np.all(np.isfinite(samples)):
+                raise ValueError('Nonfinite sampled data in the valid interval')
+            if instrument is not None:
+                samples /= instrument[offset:end]
+            values = xp.median(xp.asarray(samples), axis=0)
+            median[offset:end] = values if xp is np else xp.asnumpy(values)
+        window, order = smoothing_parameters(size, min(window_size, max(1, round(size / 10))), 9)
+        residual = positive_profile(savgol_filter(median, window, order), 'Residual bandpass')
+        residual /= residual.mean()
+        combined = residual if instrument is None else instrument * residual
+        final_ws, final_od = smoothing_parameters(
+            size, final_window if final_window is not None else (int(round(np.sqrt(size))) | 1), 4)
+        final = smooth_bpmodel(combined, od=final_od, window_size=final_ws)
+        profile = np.ones(nchans, dtype=np.float32)
+        profile[start:stop] = final.astype(np.float32)
+        positive_profile(profile[start:stop], 'Final float32 bandpass')
 
-        print(f"\nPass 1 – estimating bpm from {len(sample_idx)} sampled rows …")
-        for out_i, row_i in enumerate(sample_idx):
-            raw = ds[row_i]
-            row = raw[0].astype(np.float64) if squeeze else raw.astype(np.float64)
-
-            if instr_bandpass is not None:
-                row = row / instr_bandpass
-
-            row_medians[out_i] = row
-            print(f"  sampling row {out_i+1}/{len(sample_idx)}  (file row {row_i})", end="\r")
-
-        meanSpec = xp.nanmedian(xp.array(row_medians), axis=0)
-        meanSpec_cpu = cp.asnumpy(meanSpec) if GPU_AVAILABLE else meanSpec
-        print(meanSpec_cpu.shape)
-
-        # Window/order for the Savitzky-Golay fit, capped at window_size
-        ws = int(round(F / 10.0))
-        ws = min(window_size, ws)
-        if ws % 2 == 0:
-            ws += 1
-        od = min(9, ws - 2)
-
-        residual_ripple = savgol_filter(meanSpec_cpu, ws, od, deriv=0)
-        if np.all(np.isnan(residual_ripple)):
-            raise ValueError("savgol_filter returned all NaNs — meanSpec is likely all NaN or zero")
-
-        residual_ripple = np.ma.array(residual_ripple, mask=~np.isfinite(residual_ripple))
-        if residual_ripple.mean() == 0:
-            residual_ripple += 1
-        residual_ripple = np.asarray(residual_ripple / residual_ripple.mean(), dtype=np.float64)
-
-        print(f"\nResidual ripple fit  (ws={ws}, od={od})  |  "
-              f"min={residual_ripple.min():.4f}  max={residual_ripple.max():.4f}")
-
-        # ── combine instrumental model x residual ripple = full bandpass ─
-        if instr_bandpass is not None:
-            combined_bpm = instr_bandpass * residual_ripple
-            combined_bpm = combined_bpm / combined_bpm.mean()
-            print(f"Combined bpm (instr × ripple)  |  "
-                  f"min={combined_bpm.min():.4f}  max={combined_bpm.max():.4f}")
-        else:
-            combined_bpm = residual_ripple
-            print("Combined bpm = residual ripple (no instr. bandpass supplied)")
-
-        bpm_gpu = xp.array(combined_bpm)  # pushed once, reused every chunk below
-
-        # ── write the 1-D combined bandpass model dataset ─────────────────
-        if bpm_dataset in f:
-            del f[bpm_dataset]
-        bpm_ds = f.create_dataset(
-            bpm_dataset, data=combined_bpm, dtype=np.float64,
-            compression="gzip", compression_opts=4,
-        )
-        bpm_ds.attrs["savgol_window"] = ws
-        bpm_ds.attrs["savgol_order"] = od
-        bpm_ds.attrs["estimation_rows_used"] = len(sample_idx)
-        bpm_ds.attrs["source_dataset"] = input_dataset
-        bpm_ds.attrs["instrumental_bandpass"] = instr_bandpass is not None
-        bpm_ds.attrs["components"] = (
-            "instrumental x residual_pfb_ripple"
-            if instr_bandpass is not None else "residual_pfb_ripple_only"
-        )
-        print(f"Saved combined bpm → '{bpm_dataset}'  shape {combined_bpm.shape}  float64")
-
-        # ── create the corrected output dataset ───────────────────────────
-        if output_dataset in f:
-            del f[output_dataset]
-        out_ds = f.create_dataset(
-            output_dataset, shape=raw_shape, dtype=np.float32,
-            chunks=(1, 1, min(F, 131072)) if squeeze else (1, min(F, 131072)),
-            compression="gzip", compression_opts=4,
-        )
-        out_ds.attrs["bandpass_correction"] = "savgol_median"
-        out_ds.attrs["savgol_window"] = ws
-        out_ds.attrs["savgol_order"] = od
-        out_ds.attrs["source_dataset"] = input_dataset
-        out_ds.attrs["bpm_dataset"] = bpm_dataset
-        out_ds.attrs["instrumental_bandpass"] = instr_bandpass is not None
-        print(f"Created output dataset '{output_dataset}'  {raw_shape}  float32")
-
-        # ── PASS 2: stream through the file, divide by combined_bpm ──────
-        print(f"\nPass 2 – correcting in chunks of {chunk_size} rows …")
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            chunk = ds[start:end]
-            data = chunk[:, 0, :].astype(np.float64) if squeeze else chunk.astype(np.float64)
-
-            corrected = (xp.array(data) / bpm_gpu).astype(xp.float32)
-            corrected_cpu = cp.asnumpy(corrected) if GPU_AVAILABLE else corrected
-
-            if squeeze:
-                out_ds[start:end, 0, :] = corrected_cpu
-            else:
-                out_ds[start:end, :] = corrected_cpu
-
-            pct = 100.0 * end / N
-            print(f"  rows {start:>4}–{end:>4} / {N}  ({pct:.1f}%)", end="\r")
-
-        print(f"\nDone. '{output_dataset}' and '{bpm_dataset}' written to {hdf5_path}")
-
-    return combined_bpm
+        work = f.create_group(WORK_GROUP)
+        work.attrs['state'] = 'writing'
+        work['raw'] = ds
+        model = work.create_dataset('bandpass_model', data=profile)
+        metadata = {
+            'bandpass_correction_version': CORRECTION_VERSION,
+            'source_dataset': 'uncorrected',
+            'bpm_dataset': 'bandpass_model',
+            'bandpass_correction': 'savgol_median_final_smoothed',
+            'savgol_window': window, 'savgol_order': order,
+            'final_savgol_window': final_ws, 'final_savgol_order': final_od,
+            'estimation_rows_used': len(sample_idx),
+            'instrumental_bandpass': instrument is not None,
+        }
+        model.attrs.update(metadata)
+        for key in LAYOUT_KEYS:
+            model.attrs[key] = ds.attrs[key]
+        model.attrs['excluded_region_value'] = 1.0
+        out = work.create_dataset('corrected', shape=ds.shape, dtype=np.float32,
+                                  chunks=(1, 1, min(nchans, channel_block)), fillvalue=-1.0)
+        out.attrs.update(dict(ds.attrs))
+        # Completion version is set only after all data blocks pass validation.
+        out.attrs.update({key: value for key, value in metadata.items()
+                          if key != 'bandpass_correction_version'})
+        out.attrs['nbits'] = 32
+        for axis, dim in enumerate(ds.dims):
+            out.dims[axis].label = dim.label
+        f.flush()
+        _correct_blocks(ds, f['mask'], out, profile, start, stop, chunk_size, channel_block, xp)
+        out.attrs['bandpass_correction_version'] = CORRECTION_VERSION
+        f.flush()
+        work.attrs['state'] = 'ready'
+        f.flush()
+        _promote(f)
+        print('Saved final profile and promoted flattened data; originals retained as uncorrected')
+        return profile
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
-
-def main(TESTDATA, OUTFILE):
-    with h5py.File(TESTDATA, 'r') as f:
-        # Frequency axis is stored as start freq (fch1) + per-channel offset (foff), in MHz
-        fch1 = f['data'].attrs['fch1']
-        foff = f['data'].attrs['foff']
-        nchans = f['data'].attrs['nchans']
-        freqs = fch1 + foff * np.arange(nchans)
-        keys = list(f.keys())
-
-    # 1. Instrumental bandpass, normalized to [0, 1] with a tiny floor to
-    #    avoid divide-by-zero later.
-    bpm_i = compute_bandpass_instrumental(freqs * 1e6)  # needs Hz, freqs is MHz
-    bpm_i = (bpm_i - bpm_i.min()) / (bpm_i.max() - bpm_i.min())
-    bpm_i[bpm_i == 0.0] += 1e-16
-
-    # 2. If this file hasn't already been bandpass-corrected, fit the
-    #    residual PFB ripple and write 'corrected' + 'bandpass_model' into
-    #    the HDF5 file. Skip if it's already been done (e.g. re-running
-    #    the pipeline on the same file).
-    if 'corrected' not in keys:
-        print('Uncorrected File, making the fit!')
-        computeBandpassData_streaming(
-            hdf5_path=TESTDATA,
-            input_dataset="data",
-            output_dataset="corrected",
-            bpm_dataset="bandpass_model",
-            bpm_estimation_chunks=32,
-            instr_bandpass=bpm_i,
-            window_size=41,
-        )
-    else:
-        print('Corrected File, proceed!')
-
-    # 3. Read back the combined bandpass model, smooth it once more, and
-    #    write it out as the standalone .f32 file that run_pipeline.py
-    #    passes to chunk_and_bliss.py as --bp.
-    with h5py.File(TESTDATA, 'r') as f:
-        bpm_m = f['bandpass_model'][:]
-
-    bpm5 = smooth_bpmodel(bpm_m, od=4)
-    bpm5 = bpm5.data.astype(np.float32)
-    bpm5.tofile(OUTFILE)
-    return
+def main(TESTDATA, OUTFILE=None, *, force=False, **options):
+    if OUTFILE is None:
+        OUTFILE = os.path.basename(TESTDATA).split('.')[0] + '_bpmodel.f32'
+    if os.path.realpath(OUTFILE) == os.path.realpath(TESTDATA):
+        raise ValueError('Profile export must not overwrite the input HDF5 file')
+    profile = computeBandpassData_streaming(TESTDATA, force=force, use_instrumental=True, **options)
+    # The saved and applied profile is already float32; no additional smoothing.
+    profile.tofile(OUTFILE)
+    print(f'Exported the applied profile to {OUTFILE}')
 
 
-if __name__ == "__main__":
-    filename = sys.argv[-1]
-    outfile = os.path.basename(filename).split('.')[0] + "_bpmodel.f32"
-    main(filename, outfile)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('h5_path')
+    parser.add_argument('--output', help='Export profile path (default: <basename>_bpmodel.f32 in cwd)')
+    parser.add_argument('--force', action='store_true', help='Refit original data; restart interrupted correction')
+    parser.add_argument('--sample-rows', type=int, default=32)
+    parser.add_argument('--row-block', type=int, default=16)
+    parser.add_argument('--channel-block', type=int, default=131072)
+    parser.add_argument('--window-size', type=int, default=41, help='Residual smoothing window cap')
+    parser.add_argument('--final-window', type=int, help='Final smoothing window (default: sqrt(valid channels))')
+    args = parser.parse_args()
+    main(args.h5_path, args.output, force=args.force, bpm_estimation_chunks=args.sample_rows,
+         chunk_size=args.row_block, channel_block=args.channel_block,
+         window_size=args.window_size, final_window=args.final_window)

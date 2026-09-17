@@ -62,13 +62,73 @@ same arguments. Use your patched virtual environment's Python and existing LSL
 environment settings for legacy data. Output tuning files are written in the
 current working directory.
 
-**Integration status:** these changes cover the first half only. The existing
-second-half bandpass fitter and chunker do not yet honor this layout. Do not use
-the new sentinel-filled files with that workflow until it is updated. The mask
-and -1.0 values do not make BLISS skip these channels automatically. Bandpass
-correction and promotion of `corrected` to `data` remain second-half work.
+### Fit and apply the bandpass
 
-Run the synthetic first-half checks with:
+Run the updated fitting stage independently on each new full-grid tuning file:
+
+```bash
+/path/to/venv/bin/python3 /path/to/LoFreq-SETI/second_half_pipeline/lwa_bliss_bp_gen.py \
+  /path/to/observation-LWA1_tun1.h5
+```
+
+The fitter reads and validates the layout recorded by the first half; it does
+not take new coarse-channel settings. It computes the instrumental response and
+fits the sampled residual spectrum **only within the valid interval**. Both the
+residual and final smoothing stay within that interval, and all normalizations
+exclude the edge sentinels. The instrumental response is scaled by its mean,
+without subtracting its minimum. Nonfinite/nonpositive responses fail explicitly
+instead of being replaced by tiny denominators.
+
+The **final smoothed, mean-one float32 profile** is used for correction and saved
+as `bandpass_model` in the same HDF5 file. It has one value per original fine
+channel, with neutral values of **1.0** outside the valid interval. The exact same
+array is exported as `<basename>_bpmodel.f32` in the current working directory;
+use `--output /path/to/profile.f32` to choose another location. No further
+smoothing is performed on export.
+
+Once all corrected blocks have been validated, the file contains:
+
+| Dataset | Contents |
+| --- | --- |
+| `uncorrected` | Original first-half data, retained for inspection and refitting |
+| `data` | Flattened interior, with excluded edges still equal to -1.0 |
+| `mask` | Original mask, unchanged |
+| `bandpass_model` | Final profile actually applied to the data |
+
+The corrected `data` preserves filterbank attributes, layout metadata, and axis
+labels. Correction version, source dataset, sampled-row count, instrumental-model
+usage, and actual residual/final smoothing windows and orders are recorded on the
+data and model. The model also records the original coarse layout.
+
+A normal rerun reuses a completed correction and recreates the profile export.
+Use `--force` to refit **uncorrected**, including when changing fitting parameters;
+it never fits already-flattened data. An interrupted block write is detected and
+requires `--force` to restart. A completed staged correction interrupted during
+promotion is finished on the next invocation. Staging uses HDF5 hard links to
+preserve the original datasets during promotion; it is not a guarantee against
+filesystem corruption or power-loss damage to the HDF5 file itself.
+
+Defaults are `--sample-rows 32`, `--row-block 16`, `--channel-block 131072`,
+`--window-size 41` for the residual fit, and an odd window near the square root
+of the valid-channel count for final smoothing (`--final-window` overrides it).
+Smoothing windows/orders are reduced for short valid intervals. Fitting samples
+and correction are processed in bounded frequency blocks, with CuPy used when
+an accessible GPU is available and NumPy otherwise. Corrected data are written
+without compression to avoid another compression bottleneck; retaining original
+and corrected data requires space for both datasets. Failed/repeated refits can
+leave HDF5 free space; deleting datasets does not necessarily shrink the file.
+
+**Integration status:** the first half and standalone fitter now support this
+layout. The next step is replacing the old chunk-and-BLISS workflow with direct
+coarse-channel processing, including explicit edge exclusion and BLISS
+preprocessing control. Do not run the existing end-to-end second-half runner on
+these files yet. The legacy chunker rejects already-corrected data to prevent
+double bandpass correction. The mask and -1.0 values do not make BLISS skip the
+excluded channels automatically. Old files without layout metadata and legacy
+files containing a `corrected` dataset are rejected; start from updated
+first-half output.
+
+Run the synthetic first-half and fitting checks with:
 
 ```bash
 python3 -m unittest discover -s tests -v

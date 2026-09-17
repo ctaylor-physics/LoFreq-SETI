@@ -166,6 +166,12 @@ def process_file(h5_path, bp_path, outdir, nchan, chunksize, min_overlap):
 
     Returns the path to the final combined hits CSV.
     """
+    with h5py.File(h5_path, 'r') as source:
+        if 'bandpass_correction_version' in source['data'].attrs:
+            raise ValueError(
+                'This file is already bandpass-corrected. The legacy chunker would '
+                'apply the bandpass twice; use the forthcoming direct coarse-channel runner.'
+            )
     os.makedirs(outdir, exist_ok=True)
     orig_cwd = os.getcwd()
     os.chdir(outdir)
