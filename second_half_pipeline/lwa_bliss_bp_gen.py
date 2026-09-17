@@ -147,10 +147,22 @@ def read_layout(ds, mask):
     return start, stop
 
 
-def positive_profile(profile, label):
+def positive_profile(profile, label, channel_offset=0):
     profile = np.asarray(profile, dtype=np.float64)
-    if profile.ndim != 1 or not np.all(np.isfinite(profile)) or np.any(profile <= 0):
-        raise ValueError(f'{label} must be finite and positive throughout the valid interval')
+    if profile.ndim != 1 or profile.size == 0:
+        raise ValueError(f'{label} must be a nonempty one-dimensional profile')
+    nonfinite = ~np.isfinite(profile)
+    nonpositive = np.isfinite(profile) & (profile <= 0)
+    if np.any(nonfinite | nonpositive):
+        channels = np.flatnonzero(nonfinite | nonpositive)[:8] + channel_offset
+        finite = profile[np.isfinite(profile)]
+        minimum = float(finite.min()) if finite.size else float('nan')
+        raise ValueError(
+            f'{label} must be finite and positive throughout the valid interval: '
+            f'{np.count_nonzero(nonfinite)} nonfinite, '
+            f'{np.count_nonzero(nonpositive)} nonpositive of {profile.size}; '
+            f'finite minimum={minimum:.6g}; first affected fine-channel indices={channels.tolist()}'
+        )
     return profile
 
 
@@ -163,13 +175,37 @@ def smoothing_parameters(size, window, order):
     return window, min(order, window - 1)
 
 
-def smooth_bpmodel(bpmodel, od=4, window_size=None):
+def smooth_positive(profile, window, order, label, channel_offset=0):
+    """Keep the linear SG fit when valid; otherwise fit positive data in log space.
+
+    Polynomial filters have negative weights and can undershoot around strong
+    narrow features. Bound the fallback log fit to the observed input range,
+    avoiding artificial near-zero denominators from polynomial extrapolation.
+    Invalid input values are diagnosed, never silently clipped or interpolated.
+    """
+    profile = positive_profile(profile, f'{label} input', channel_offset)
+    result = savgol_filter(profile, window, order)
+    if np.all(np.isfinite(result)) and np.all(result > 0):
+        return result, 'linear'
+    bad = ~np.isfinite(result) | (result <= 0)
+    print(f'{label}: linear smoothing produced {np.count_nonzero(bad)} invalid bins; '
+          'using bounded log-space smoothing of the positive input')
+    logarithm = np.log(profile)
+    fitted_log = savgol_filter(logarithm, window, order)
+    if not np.all(np.isfinite(fitted_log)):
+        raise ValueError(f'{label}: log-space smoothing produced nonfinite values')
+    result = np.exp(np.clip(fitted_log, logarithm.min(), logarithm.max()))
+    return positive_profile(result, label, channel_offset), 'log_fallback'
+
+
+def smooth_bpmodel(bpmodel, od=4, window_size=None, *, channel_offset=0, return_method=False):
     """Final smoothing of the valid interval only; return a mean-one profile."""
-    profile = positive_profile(bpmodel, 'Combined bandpass')
+    profile = positive_profile(bpmodel, 'Combined bandpass', channel_offset)
     requested = window_size if window_size is not None else (int(round(np.sqrt(profile.size))) | 1)
     window, order = smoothing_parameters(profile.size, requested, od)
-    result = positive_profile(savgol_filter(profile, window, order), 'Smoothed bandpass')
-    return result / result.mean()
+    result, method = smooth_positive(profile, window, order, 'Smoothed bandpass', channel_offset)
+    result = result / result.mean()
+    return (result, method) if return_method else result
 
 
 def _promote(f):
@@ -184,7 +220,7 @@ def _promote(f):
         raise ValueError('Staged bandpass output has inconsistent shapes')
     if corrected.attrs.get('bandpass_correction_version') != CORRECTION_VERSION:
         raise ValueError('Staged corrected data are not marked complete')
-    positive_profile(model[start:stop], 'Staged bandpass')
+    positive_profile(model[start:stop], 'Staged bandpass', start)
     if 'uncorrected' in f and f['uncorrected'].id != raw.id:
         raise ValueError('Existing uncorrected data do not match the staged source')
     if 'uncorrected' not in f:
@@ -231,7 +267,7 @@ def _source(f, force):
         if model.shape != (ds.shape[2],) or model.attrs.get('bandpass_correction_version') != CORRECTION_VERSION:
             raise ValueError('Invalid saved bandpass model')
         if not force:
-            positive_profile(model[start:stop], 'Saved bandpass')
+            positive_profile(model[start:stop], 'Saved bandpass', start)
             print('Bandpass correction already complete; reusing the saved profile')
             return None
         return ds
@@ -309,7 +345,7 @@ def computeBandpassData_streaming(
             freqs = ds.attrs['fch1'] + ds.attrs['foff'] * np.arange(start, stop)
             instrument = compute_bandpass_instrumental(freqs * 1e6)
         if instrument is not None:
-            instrument = positive_profile(instrument, 'Instrumental bandpass')
+            instrument = positive_profile(instrument, 'Instrumental bandpass', start)
             if instrument.shape != (size,):
                 raise ValueError('Instrumental response does not match the valid interval')
             # Do not subtract the minimum: a response floor near zero can amplify
@@ -330,15 +366,16 @@ def computeBandpassData_streaming(
             values = xp.median(xp.asarray(samples), axis=0)
             median[offset:end] = values if xp is np else xp.asnumpy(values)
         window, order = smoothing_parameters(size, min(window_size, max(1, round(size / 10))), 9)
-        residual = positive_profile(savgol_filter(median, window, order), 'Residual bandpass')
+        residual, residual_method = smooth_positive(median, window, order, 'Residual bandpass', start)
         residual /= residual.mean()
         combined = residual if instrument is None else instrument * residual
         final_ws, final_od = smoothing_parameters(
             size, final_window if final_window is not None else (int(round(np.sqrt(size))) | 1), 4)
-        final = smooth_bpmodel(combined, od=final_od, window_size=final_ws)
+        final, final_method = smooth_bpmodel(combined, od=final_od, window_size=final_ws,
+                                             channel_offset=start, return_method=True)
         profile = np.ones(nchans, dtype=np.float32)
         profile[start:stop] = final.astype(np.float32)
-        positive_profile(profile[start:stop], 'Final float32 bandpass')
+        positive_profile(profile[start:stop], 'Final float32 bandpass', start)
 
         work = f.create_group(WORK_GROUP)
         work.attrs['state'] = 'writing'
@@ -351,6 +388,9 @@ def computeBandpassData_streaming(
             'bandpass_correction': 'savgol_median_final_smoothed',
             'savgol_window': window, 'savgol_order': order,
             'final_savgol_window': final_ws, 'final_savgol_order': final_od,
+            'smoothing_policy': 'linear_with_bounded_log_fallback_v1',
+            'residual_smoothing_method': residual_method,
+            'final_smoothing_method': final_method,
             'estimation_rows_used': len(sample_idx),
             'instrumental_bandpass': instrument is not None,
         }

@@ -79,6 +79,14 @@ exclude the edge sentinels. The instrumental response is scaled by its mean,
 without subtracting its minimum. Nonfinite/nonpositive responses fail explicitly
 instead of being replaced by tiny denominators.
 
+Savitzky–Golay fits can undershoot below zero around strong narrow spectral
+features. Both smoothing stages keep the linear fit when it is finite and
+positive; otherwise they refit the positive input in log space, bounded to the
+observed input range before normalization. The selected methods are logged and
+stored as `residual_smoothing_method` and `final_smoothing_method` on `data` and
+`bandpass_model`. Invalid input profiles still fail, with counts and affected
+fine-channel indices, rather than being silently floored or interpolated.
+
 The **final smoothed, mean-one float32 profile** is used for correction and saved
 as `bandpass_model` in the same HDF5 file. It has one value per original fine
 channel, with neutral values of **1.0** outside the valid interval. The exact same

@@ -226,6 +226,45 @@ class BandpassTests(unittest.TestCase):
         bliss.assert_not_called()
         self.assertFalse(outdir.exists())
 
+    def test_strong_positive_spike_uses_positive_residual_fallback(self):
+        raw, _, _, start, stop = self.fixture()
+        with h5py.File(self.path, 'r+') as f:
+            f['data'][:, 0, (start + stop) // 2] *= 1000
+            raw = f['data'][:]
+        profile = self.fit()
+        self.assertTrue(np.all(np.isfinite(profile)) and np.all(profile > 0))
+        with h5py.File(self.path) as f:
+            self.assertEqual(f['bandpass_model'].attrs['residual_smoothing_method'], 'log_fallback')
+            np.testing.assert_array_equal(f['uncorrected'][:], raw)
+            expected = (raw[:, 0, start:stop].astype('float64') / profile[start:stop]).astype('float32')
+            np.testing.assert_array_equal(f['data'][:, 0, start:stop], expected)
+            np.testing.assert_array_equal(f['data'][:, 0, :start], -1.0)
+
+    def test_final_smoothing_fallback_and_unchanged_positive_linear_fit(self):
+        from scipy.signal import savgol_filter
+        profile = np.ones(384)
+        profile[192] = 1000
+        self.assertLess(savgol_filter(profile, 21, 4).min(), 0)
+        smoothed, method = bp.smooth_bpmodel(profile, window_size=21, return_method=True)
+        self.assertEqual(method, 'log_fallback')
+        self.assertTrue(np.all(np.isfinite(smoothed)) and np.all(smoothed > 0))
+        self.assertAlmostEqual(smoothed.mean(), 1)
+        smooth_input = 1 + np.linspace(0, 1, 384) ** 2
+        smoothed, method = bp.smooth_bpmodel(smooth_input, window_size=21, return_method=True)
+        expected = savgol_filter(smooth_input, 21, 4)
+        self.assertEqual(method, 'linear')
+        np.testing.assert_array_equal(smoothed, expected / expected.mean())
+
+    def test_invalid_sampled_median_reports_global_indices_without_writes(self):
+        _, _, _, start, _ = self.fixture()
+        with h5py.File(self.path, 'r+') as f:
+            f['data'][:, 0, start + 5] = 0
+        with self.assertRaisesRegex(ValueError,
+                                    rf'Residual bandpass input.*1 nonpositive.*indices=\[{start + 5}\]'):
+            self.fit()
+        with h5py.File(self.path) as f:
+            self.assertEqual(set(f), {'data', 'mask'})
+
 
 if __name__ == '__main__':
     unittest.main()
