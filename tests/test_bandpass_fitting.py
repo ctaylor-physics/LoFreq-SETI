@@ -61,7 +61,8 @@ class BandpassTests(unittest.TestCase):
                 raw, mask, shape, start, stop = self.fixture(n, coarse, edges, descending)
                 profile = self.fit()
                 with h5py.File(self.path) as f:
-                    self.assertEqual(set(f), {'data', 'uncorrected', 'mask', 'bandpass_model'})
+                    self.assertEqual(set(f), {'data', 'uncorrected', 'mask', 'bandpass_model',
+                                              'bandpass_fit_clipped_channels'})
                     np.testing.assert_array_equal(f['uncorrected'][:], raw)
                     np.testing.assert_array_equal(f['mask'][:], mask)
                     np.testing.assert_array_equal(f['bandpass_model'][:], profile)
@@ -262,6 +263,58 @@ class BandpassTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,
                                     rf'Residual bandpass input.*1 nonpositive.*indices=\[{start + 5}\]'):
             self.fit()
+        with h5py.File(self.path) as f:
+            self.assertEqual(set(f), {'data', 'mask'})
+
+    def test_optional_clipping_preserves_broad_features_and_edges(self):
+        rng = np.random.default_rng(17)
+        spectrum = 2 + np.linspace(0, 1, 501) + rng.normal(0, .01, 501)
+        spectrum[250] += 10
+        spectrum[350:370] += 20  # Too broad to interpolate.
+        spectrum[0] += 10       # No left interpolation anchor.
+        original = spectrum.copy()
+        clipped, indices, counts = bp.clip_fit_spectrum(spectrum)
+        np.testing.assert_array_equal(spectrum, original)
+        np.testing.assert_array_equal(indices, [250])
+        self.assertEqual(clipped[250], (spectrum[249] + spectrum[251]) / 2)
+        np.testing.assert_array_equal(clipped[350:370], spectrum[350:370])
+        self.assertEqual(clipped[0], spectrum[0])
+        self.assertEqual(counts['fit_clip_skipped_broad_bins'], 20)
+        self.assertEqual(counts['fit_clip_skipped_edge_bins'], 1)
+
+    def test_clipping_is_fit_only_auditable_and_requires_force_to_change(self):
+        _, mask, _, start, stop = self.fixture()
+        spike = (start + stop) // 2
+        with h5py.File(self.path, 'r+') as f:
+            f['data'][:, 0, spike] *= 1000
+            raw = f['data'][:]
+        baseline = self.fit()
+        with self.assertRaisesRegex(ValueError, 'settings differ.*--force'):
+            self.fit(fit_clip=True)
+        clipped = self.fit(force=True, fit_clip=True)
+        self.assertLess(clipped[spike], baseline[spike])
+        with h5py.File(self.path) as f:
+            np.testing.assert_array_equal(f['uncorrected'][:], raw)
+            np.testing.assert_array_equal(f['mask'][:], mask)
+            np.testing.assert_array_equal(f['bandpass_fit_clipped_channels'][:], [spike])
+            self.assertTrue(f['bandpass_model'].attrs['fit_clip_enabled'])
+            self.assertEqual(f['data'].attrs['fit_clip_rejected_bins'], 1)
+            expected = (raw[:, 0, start:stop].astype('float64') / clipped[start:stop]).astype('float32')
+            np.testing.assert_array_equal(f['data'][:, 0, start:stop], expected)
+        with self.assertRaisesRegex(ValueError, 'settings differ.*--force'):
+            self.fit(fit_clip=True, fit_clip_sigma=30)
+        # Switching off refits the raw measurements and clears the audit indices.
+        np.testing.assert_array_equal(self.fit(force=True), baseline)
+        with h5py.File(self.path) as f:
+            self.assertEqual(f['bandpass_fit_clipped_channels'].shape, (0,))
+
+    def test_invalid_clipping_settings_fail_before_modifying_input(self):
+        self.fixture()
+        for options in ({'fit_clip_sigma': 0}, {'fit_clip_sigma': float('nan')},
+                        {'fit_clip_window': 100}, {'fit_clip_max_width': 51},
+                        {'fit_clip': True, 'fit_clip_window': 501}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.fit(**options)
         with h5py.File(self.path) as f:
             self.assertEqual(set(f), {'data', 'mask'})
 

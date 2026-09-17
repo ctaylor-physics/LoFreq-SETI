@@ -87,6 +87,45 @@ stored as `residual_smoothing_method` and `final_smoothing_method` on `data` and
 `bandpass_model`. Invalid input profiles still fail, with counts and affected
 fine-channel indices, rather than being silently floored or interpolated.
 
+#### Optional clipping of the fitting spectrum
+
+Clipping is **off by default**. Enable it for comparison tests with `--fit-clip`:
+
+```bash
+python3 -m second_half_pipeline.lwa_bliss_bp_gen tuning.h5 --fit-clip
+# An already-corrected file must be refitted from uncorrected:
+python3 -m second_half_pipeline.lwa_bliss_bp_gen tuning.h5 --force --fit-clip \\
+  --fit-clip-sigma 10 --fit-clip-window 101 --fit-clip-max-width 8
+```
+
+Clipping acts once on the time-median spectrum after instrumental-response
+division, before either smoothing pass. A running median estimates the local
+baseline; 1.4826 times the running median of absolute residuals estimates robust
+scatter. Only **positive** deviations above `--fit-clip-sigma` are candidates.
+Contiguous candidate runs of at most `--fit-clip-max-width` fine channels are
+interpolated between their unflagged neighbors. Longer runs and runs touching
+the valid interval's endpoints are left unchanged. The window must be odd, at
+least three channels, and no longer than the valid interval; the maximum run
+width must be positive and less than half the window. These widths are in fine
+channels, so their frequency spans depend on the FFT length.
+
+The raw observations and `mask` are never edited by clipping. Settings, candidate
+counts, skipped-run counts, and rejected-bin counts are stored on `data` and
+`bandpass_model`. `bandpass_fit_clipped_channels` stores the zero-based **full-grid**
+indices interpolated in the fitting spectrum (empty when disabled). Changing
+clipping settings on a completed file requires `--force`; omitting `--fit-clip`
+with `--force` restores fitting without clipping, always from original data.
+
+The enabled starting defaults are **10 robust sigma, a 101-channel window, and
+an eight-channel maximum run**. On the supplied LWA1 example (6,815,744 valid
+channels), trials at 10, 15, 20, and 30 sigma rejected 166, 104, 77, and 52 bins,
+respectively. At 10 sigma only 0.00244% of fitting bins were replaced, both
+smoothing passes stayed positive without a log fallback, and the maximum model
+value dropped from 4.055 to 3.270. After median-normalizing profiles, 95% of
+channels changed by less than 0.0193%. This is a conservative starting point
+from one example, not a universal calibration: broader or less extreme features
+can remain in the model, and signal-recovery sensitivity still needs testing.
+
 The **final smoothed, mean-one float32 profile** is used for correction and saved
 as `bandpass_model` in the same HDF5 file. It has one value per original fine
 channel, with neutral values of **1.0** outside the valid interval. The exact same
@@ -102,6 +141,7 @@ Once all corrected blocks have been validated, the file contains:
 | `data` | Flattened interior, with excluded edges still equal to -1.0 |
 | `mask` | Original mask, unchanged |
 | `bandpass_model` | Final profile actually applied to the data |
+| `bandpass_fit_clipped_channels` | Fine-channel indices interpolated only in the fitting spectrum |
 
 The corrected `data` preserves filterbank attributes, layout metadata, and axis
 labels. Correction version, source dataset, sampled-row count, instrumental-model

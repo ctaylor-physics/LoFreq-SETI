@@ -13,6 +13,7 @@ import h5py
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
+from scipy.ndimage import median_filter
 
 from lsl.common import stations, ndp
 from lsl.reader.drx import FILTER_CODES
@@ -208,6 +209,52 @@ def smooth_bpmodel(bpmodel, od=4, window_size=None, *, channel_offset=0, return_
     return (result, method) if return_method else result
 
 
+def clip_fit_spectrum(profile, sigma=10.0, window=101, max_width=8):
+    """Replace isolated, extreme positive fit-spectrum outliers by interpolation.
+
+    Scatter is 1.4826 times the running median of absolute residuals from a
+    running-median baseline. One pass only; broad runs and edge-touching runs
+    are left alone. This operates on the fitting spectrum, never observations.
+    Returns a copy, local rejected indices, and counts for audit metadata.
+    """
+    if not np.isfinite(sigma) or sigma <= 0:
+        raise ValueError('Fit clipping sigma must be finite and positive')
+    if window < 3 or window % 2 != 1:
+        raise ValueError('Fit clipping window must be odd and at least 3 channels')
+    if max_width < 1 or 2 * max_width >= window:
+        raise ValueError('Fit clipping max width must be positive and less than half the window')
+    profile = positive_profile(profile, 'Fit clipping spectrum')
+    if profile.size < window:
+        raise ValueError('Fit clipping window exceeds the valid interval; choose a smaller window or disable clipping')
+    baseline = median_filter(profile, size=window, mode='reflect')
+    residual = profile - baseline
+    mad = median_filter(np.abs(residual), size=window, mode='reflect')
+    # Only a roundoff floor, not an empirical noise level or signal threshold.
+    floor = 16 * np.finfo(np.float64).eps * np.maximum(np.abs(baseline), 1.0)
+    scatter = np.maximum(1.4826 * mad, floor)
+    candidates = residual > sigma * scatter
+    transitions = np.diff(np.r_[False, candidates, False].astype(np.int8))
+    starts, stops = np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)
+    result = profile.copy()
+    clipped = []
+    skipped_broad = skipped_edge = 0
+    for start, stop in zip(starts, stops):
+        if stop - start > max_width:
+            skipped_broad += stop - start
+            continue
+        if start == 0 or stop == profile.size:
+            skipped_edge += stop - start
+            continue
+        indices = np.arange(start, stop)
+        result[start:stop] = np.interp(indices, [start - 1, stop], profile[[start - 1, stop]])
+        clipped.extend(indices)
+    return result, np.asarray(clipped, dtype=np.int64), {
+        'fit_clip_candidates': int(np.count_nonzero(candidates)),
+        'fit_clip_skipped_broad_bins': int(skipped_broad),
+        'fit_clip_skipped_edge_bins': int(skipped_edge),
+    }
+
+
 def _promote(f):
     """Idempotently finish a validated correction using staged hard links."""
     work = f[WORK_GROUP]
@@ -225,7 +272,10 @@ def _promote(f):
         raise ValueError('Existing uncorrected data do not match the staged source')
     if 'uncorrected' not in f:
         f['uncorrected'] = raw
-    for name, dataset in (('data', corrected), ('bandpass_model', model)):
+    outputs = [('data', corrected), ('bandpass_model', model)]
+    if 'bandpass_fit_clipped_channels' in work:
+        outputs.append(('bandpass_fit_clipped_channels', work['bandpass_fit_clipped_channels']))
+    for name, dataset in outputs:
         if name in f and f[name].id == dataset.id:
             continue
         if name in f:
@@ -268,7 +318,6 @@ def _source(f, force):
             raise ValueError('Invalid saved bandpass model')
         if not force:
             positive_profile(model[start:stop], 'Saved bandpass', start)
-            print('Bandpass correction already complete; reusing the saved profile')
             return None
         return ds
     if 'uncorrected' in f or 'bandpass_model' in f:
@@ -311,6 +360,7 @@ def computeBandpassData_streaming(
     bpm_dataset='bandpass_model', chunk_size=16, bpm_estimation_chunks=32,
     instr_bandpass=None, window_size=41, *, force=False, channel_block=131072,
     final_window=None, use_instrumental=False,
+    fit_clip=False, fit_clip_sigma=10.0, fit_clip_window=101, fit_clip_max_width=8,
 ):
     """Apply the final smoothed profile and promote the result, preserving raw data.
 
@@ -325,13 +375,29 @@ def computeBandpassData_streaming(
         raise ValueError('Block sizes, estimation-row count, and smoothing window must be positive')
     if final_window is not None and final_window < 1:
         raise ValueError('Final smoothing window must be positive')
+    clip_settings = {'fit_clip_enabled': bool(fit_clip), 'fit_clip_sigma': fit_clip_sigma,
+                     'fit_clip_window': fit_clip_window, 'fit_clip_max_width': fit_clip_max_width}
+    if not np.isfinite(fit_clip_sigma) or fit_clip_sigma <= 0:
+        raise ValueError('Fit clipping sigma must be finite and positive')
+    if fit_clip_window < 3 or fit_clip_window % 2 != 1:
+        raise ValueError('Fit clipping window must be odd and at least 3 channels')
+    if fit_clip_max_width < 1 or 2 * fit_clip_max_width >= fit_clip_window:
+        raise ValueError('Fit clipping max width must be positive and less than half the window')
     with h5py.File(hdf5_path, 'r+') as f:
         ds = _source(f, force)
         if ds is None:
+            saved = f['bandpass_model'].attrs
+            if bool(saved.get('fit_clip_enabled', False)) != fit_clip or (
+                fit_clip and any(saved.get(key) != value for key, value in clip_settings.items())
+            ):
+                raise ValueError('Fit clipping settings differ from the saved correction; use --force to refit uncorrected')
+            print('Bandpass correction already complete; reusing the saved profile')
             return f['bandpass_model'][:]
         start, stop = read_layout(ds, f['mask'])
         nrows, _, nchans = ds.shape
         size = stop - start
+        if fit_clip and size < fit_clip_window:
+            raise ValueError('Fit clipping window exceeds the valid interval; choose a smaller window or disable clipping')
         xp = array_backend()
         print(f'Backend: {"CPU" if xp is np else "GPU"}')
         print(f'Fitting valid fine channels [{start}, {stop}) of {nchans}')
@@ -365,6 +431,16 @@ def computeBandpassData_streaming(
                 samples /= instrument[offset:end]
             values = xp.median(xp.asarray(samples), axis=0)
             median[offset:end] = values if xp is np else xp.asnumpy(values)
+        clipped_channels = np.empty(0, dtype=np.int64)
+        clip_counts = {'fit_clip_candidates': 0, 'fit_clip_skipped_broad_bins': 0,
+                       'fit_clip_skipped_edge_bins': 0}
+        if fit_clip:
+            positive_profile(median, 'Residual bandpass input', start)
+            median, clipped_channels, clip_counts = clip_fit_spectrum(
+                median, fit_clip_sigma, fit_clip_window, fit_clip_max_width)
+            clipped_channels += start
+            print(f'Fit clipping: replaced {clipped_channels.size} bins at {fit_clip_sigma:g} robust sigma '
+                  f'(window={fit_clip_window}, maximum run={fit_clip_max_width})')
         window, order = smoothing_parameters(size, min(window_size, max(1, round(size / 10))), 9)
         residual, residual_method = smooth_positive(median, window, order, 'Residual bandpass', start)
         residual /= residual.mean()
@@ -381,6 +457,8 @@ def computeBandpassData_streaming(
         work.attrs['state'] = 'writing'
         work['raw'] = ds
         model = work.create_dataset('bandpass_model', data=profile)
+        clipped_ds = work.create_dataset('bandpass_fit_clipped_channels', data=clipped_channels)
+        clipped_ds.attrs['description'] = 'Zero-based full-grid fine-channel indices interpolated only in the fitting spectrum'
         metadata = {
             'bandpass_correction_version': CORRECTION_VERSION,
             'source_dataset': 'uncorrected',
@@ -393,7 +471,11 @@ def computeBandpassData_streaming(
             'final_smoothing_method': final_method,
             'estimation_rows_used': len(sample_idx),
             'instrumental_bandpass': instrument is not None,
+            'fit_clip_rejected_bins': clipped_channels.size,
+            'fit_clip_method': 'positive_local_median_mad_single_pass_v1',
         }
+        metadata.update(clip_settings)
+        metadata.update(clip_counts)
         model.attrs.update(metadata)
         for key in LAYOUT_KEYS:
             model.attrs[key] = ds.attrs[key]
@@ -439,7 +521,13 @@ if __name__ == '__main__':
     parser.add_argument('--channel-block', type=int, default=131072)
     parser.add_argument('--window-size', type=int, default=41, help='Residual smoothing window cap')
     parser.add_argument('--final-window', type=int, help='Final smoothing window (default: sqrt(valid channels))')
+    parser.add_argument('--fit-clip', action='store_true', help='Enable optional positive outlier rejection in the fitting spectrum (default: off)')
+    parser.add_argument('--fit-clip-sigma', type=float, default=10.0, help='Local robust-sigma threshold when clipping is enabled (default: 10)')
+    parser.add_argument('--fit-clip-window', type=int, default=101, help='Odd running-median window in fine channels (default: 101)')
+    parser.add_argument('--fit-clip-max-width', type=int, default=8, help='Maximum contiguous outlier width to interpolate (default: 8)')
     args = parser.parse_args()
     main(args.h5_path, args.output, force=args.force, bpm_estimation_chunks=args.sample_rows,
          chunk_size=args.row_block, channel_block=args.channel_block,
-         window_size=args.window_size, final_window=args.final_window)
+         window_size=args.window_size, final_window=args.final_window,
+         fit_clip=args.fit_clip, fit_clip_sigma=args.fit_clip_sigma,
+         fit_clip_window=args.fit_clip_window, fit_clip_max_width=args.fit_clip_max_width)
