@@ -19,7 +19,60 @@ First call example: \
  `--tar-path '/data/network/recent_data/lekness/DT006_260605_0600_0001/DT006_*.tgz' `\
 ` --drx-path '/data/network/recent_data/lekness/DT006_260605_0600_0001/'`\
 ` --avg 3.0`\
-` --length 8388608`
+` --length 8388608`\
+` --num-coarse 32 --edge-coarse 3`
+
+### Full-grid first-half output
+
+The first half now retains the complete FFT frequency grid instead of trimming
+10% from each end. Both entry points (`pipeline.py` and `upchannelize.py`) accept:
+
+- `--num-coarse` (default **32**): total coarse channels across the full tuning.
+  This must be positive and divide the FFT length exactly.
+- `--edge-coarse` (default **3**): coarse channels excluded **at each edge**.
+  This may be zero and must leave at least one searchable coarse channel.
+
+For `--length 8388608 --num-coarse 32 --edge-coarse 3`, each coarse channel
+contains 262144 fine channels. The first and last 786432 fine channels are set
+to **-1.0**, removing 9.375% per edge from the usable band. The interior data
+are unchanged. `data` and `mask` retain shape `(time, 1, 8388608)`; the `uint8`
+mask is **1** at the excluded edges and **0** in the valid interior. Other FFT
+lengths can use other layouts, e.g. `--length 4096 --num-coarse 8 --edge-coarse 1`.
+
+`data.attrs` records the layout for subsequent bandpass fitting and searches:
+
+| Attribute | Meaning |
+| --- | --- |
+| `coarse_layout_version` | Layout metadata version (1) |
+| `num_coarse` | Total coarse-channel count |
+| `edge_coarse` | Number excluded at each edge |
+| `fine_channels_per_coarse` | Actual fine-channel count divided by `num_coarse` |
+| `valid_channel_start` | First valid fine-channel index, inclusive |
+| `valid_channel_stop` | End of valid fine-channel interval, exclusive |
+| `edge_mask_value` | Sentinel value (-1.0) |
+
+Indices are zero-based and follow dataset order, including for descending
+frequency axes. `fch1`, `foff`, and `nchans` describe the full grid; the valid
+frequency interval can be derived from these and the stored index bounds.
+Both actual tuning shapes are validated before writing the output files.
+
+To run from another directory, use an absolute script path, or export the repo
+root on `PYTHONPATH` and invoke `python3 -m first_half_pipeline.pipeline` with the
+same arguments. Use your patched virtual environment's Python and existing LSL
+environment settings for legacy data. Output tuning files are written in the
+current working directory.
+
+**Integration status:** these changes cover the first half only. The existing
+second-half bandpass fitter and chunker do not yet honor this layout. Do not use
+the new sentinel-filled files with that workflow until it is updated. The mask
+and -1.0 values do not make BLISS skip these channels automatically. Bandpass
+correction and promotion of `corrected` to `data` remain second-half work.
+
+Run the synthetic first-half checks with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 The second call will create a bandpass profile for each tuning file, then chunk and run BLISS, and then plot cross-check across multiple stations, and finally plot "stamps" of each hit matched at multiple stations. This call must include the direct paths to each of the tuning files (up to 4 or 6), along with chosen tolerances for the anti-coincidence test between frequency and drift-rates. The defaults are 10 Hz across and 0.8 Hz/s. These tolerances produce an average of 1 hit matched between two stations per observation. Other arguments can be tweaked, such as the stamp width (number of frequency channels around the hit), chunk size (cut of tuning file that runs through bliss), min_overlap (overlap across chunks that run through bliss), and output directory. This call first looks if there is already an existing bandpass profile for each tuning file, this way re-runs don't have to produce another as the bandpass generation takes ~10 minutes per tuning file. 
 

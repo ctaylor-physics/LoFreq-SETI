@@ -6,7 +6,7 @@ This script was a temporary solution until the LWA HDF5 files are updated to inc
 format. The script extracts the I values from each tuning and writes them to new HDF5 files with the appropriate attributes.
 
 Ancestor of upchannelize.py's convert_waterfall() and write_tuning() functions, which are now used in the pipeline to process multiple files and tunings.
-Note: this script does not trim the edges of the data, but the pipeline does. 
+Note: this legacy script does not apply the configurable coarse-channel edge flags used by the pipeline.
 """
 
 import os
