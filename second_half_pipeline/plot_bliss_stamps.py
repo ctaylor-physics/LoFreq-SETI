@@ -31,44 +31,18 @@ def freq_to_chan(freq_mhz, fch1, foff):
     return int(round((freq_mhz - fch1) / foff))
 
 
+if __package__:
+    from .hits_io import read_hits_csv
+else:
+    from hits_io import read_hits_csv
+
+
 def load_hits(csv_path):
-    """
-    Load the bliss hits CSV. The file has a leading pandas index column
-    so we add index column = 0 and re-align all the columns to the expected names. 
-    Also adds a sequential hit number column.
-    """
-    raw = pd.read_csv(csv_path, header=0)
-
-    expected_data_cols = [
-        "index", "Drift_Rate", "SNR",
-        "Uncorrected_Frequency", "Corrected_Frequency",
-        "Index", "freq_start", "freq_end",
-        "SEFD_freq", "Coarse_Channel_Number","channel two", "Full_number_of_hits",
-    ]
-
-    raw.columns = expected_data_cols  # ensure consistent column names
-    # print(f"Raw columns: {list(raw.columns)}") # uncomment for debugging
-    # print(f"First row values: {raw.iloc[0].tolist()}")
-
-
-    df = raw[expected_data_cols].copy()
-    df.columns = expected_data_cols  # ensure consistent column names
-
-    # Add a sequential hit number based on row position (Top_Hit_# resets per chunk)
-    df["hit_num"] = np.arange(1, len(df) + 1)
-
-    # Pick the MHz frequency column: whichever of Uncorrected/Corrected is < 500
-    corr = df["Corrected_Frequency"].values
-    uncorr = df["Uncorrected_Frequency"].values # these should be identical at this float depth
-
-    if corr.max() < 500:
-        df["_hit_freq_mhz"] = df["Corrected_Frequency"]
-        print(f"Using Corrected_Frequency. Sample: {corr[:5]}")
-    else:
-        df["_hit_freq_mhz"] = df["Uncorrected_Frequency"]
-        print(f"Corrected_Frequency looks like indices; using Uncorrected_Frequency. Sample: {uncorr[:5]}")
-
-    return df.reset_index(drop=True)
+    """Load the explicit corrected schema; frequency columns are already MHz."""
+    df = read_hits_csv(csv_path)
+    df['hit_num'] = np.arange(1, len(df) + 1)
+    df['_hit_freq_mhz'] = df['Corrected_Frequency']
+    return df
 
 
 
@@ -123,10 +97,6 @@ def make_stamps(hits_csv, h5_path, stamp_width=524, stamp_dir='stamps'):
         freq_end    = fch1 + foff * (nchan_total - 1)
         print(f"H5: fch1={fch1:.6f} MHz  foff={foff:.8f} MHz  tsamp={tsamp:.4f} s")
         print(f"File freq range: {min(fch1,freq_end):.4f} - {max(fch1,freq_end):.4f} MHz")
- 
-        if hits["_hit_freq_mhz"].isna().any():
-            print("Converting Index channel numbers to MHz using fch1/foff...")
-            hits["_hit_freq_mhz"] = fch1 + foff * hits["Index"]
  
         print(f"Hit freq range:  {hits['_hit_freq_mhz'].min():.4f} - {hits['_hit_freq_mhz'].max():.4f} MHz")
  

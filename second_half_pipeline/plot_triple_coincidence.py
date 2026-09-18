@@ -38,7 +38,10 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 
 # ── Reused helpers (identical logic to plot_bliss_stamps.py) ──────────────────
-from plot_bliss_stamps import load_hits, make_stamp
+if __package__:
+    from .plot_bliss_stamps import load_hits, make_stamp
+else:
+    from plot_bliss_stamps import load_hits, make_stamp
 
 def open_h5(path):
     """Open an .h5 file and return (file_handle, fch1, foff, tsamp)."""

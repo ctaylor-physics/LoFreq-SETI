@@ -166,29 +166,79 @@ without compression to avoid another compression bottleneck; retaining original
 and corrected data requires space for both datasets. Failed/repeated refits can
 leave HDF5 free space; deleting datasets does not necessarily shrink the file.
 
-**Integration status:** the first half and standalone fitter now support this
-layout. The next step is replacing the old chunk-and-BLISS workflow with direct
-coarse-channel processing, including explicit edge exclusion and BLISS
-preprocessing control. Do not run the existing end-to-end second-half runner on
-these files yet. The legacy chunker rejects already-corrected data to prevent
-double bandpass correction. The mask and -1.0 values do not make BLISS skip the
-excluded channels automatically. Old files without layout metadata and legacy
-files containing a `corrected` dataset are rejected; start from updated
-first-half output.
+The second-half runner now fits each full-grid file, searches it directly with
+BLISS, matches hits across stations, and plots coincidence stamps. It does not
+create HDF5 chunks. Old trimmed files without layout metadata are rejected;
+start from updated first-half output.
 
-Run the synthetic first-half and fitting checks with:
+```bash
+python3 -m second_half_pipeline.run_pipeline \
+    observation-LWA1_tun1.h5 observation-LWA1_tun2.h5 \
+    observation-LWA-SV_tun1.h5 observation-LWA-SV_tun2.h5 \
+    --bliss-executable /path/to/bliss_find_hits \
+    --fit-clip --freq_tol 10 --drift_tol 0.8 --width 524 \
+    --outdir pipeline_results
+```
+
+Supply both tunings for either two or three stations. Optional fitting-spectrum
+clipping remains disabled unless `--fit-clip` is supplied; its conservative
+settings are sigma 10, window 101, maximum run width 8. To change clipping on an
+already-corrected file, use `--force` to refit from `uncorrected`. Completed
+corrections are detected inside HDF5, not from the existence of an exported
+`.f32` file.
+
+To search a single file that has already been fitted:
+
+```bash
+python3 -m second_half_pipeline.run_bliss --h5 tuning.h5 \
+    --bliss-executable /path/to/bliss_find_hits --outdir hits
+```
+
+Both commands accept `--device` (e.g. `cpu` or `cuda:0`; otherwise BLISS chooses),
+`--snr` (10), `--min-drift` (-3 Hz/s), `--max-drift` (3 Hz/s),
+`--drift-step` (1), and `--distance` (7). The executable defaults to
+`BLISS_FIND_HITS` if set, otherwise `bliss_find_hits` on PATH. From another
+working directory, put the repository root on `PYTHONPATH` for `-m`, or invoke
+these scripts by their absolute filesystem paths.
+
+The coarse-channel width and excluded edges come from the HDF5 metadata:
+BLISS receives `--nchan-per-coarse`, `--coarse-channel`, and `--number-coarse`.
+For 32 coarse channels with three excluded at each edge, the search covers
+channels 3 through 28 (zero-based). The mask and sentinel values alone do not
+make BLISS skip edges. A generated unity `.f32` profile is passed with `-e`
+because omitting it invokes BLISS's default rolloff processing; the real
+bandpass has already been applied to `data`. Native coarse-channel boundaries
+have no overlapping windows, so boundary-crossing hits can differ from the
+legacy overlapping-chunk search. The old `--nchan`, `--chunksize`, and
+`--min_overlap` runner flags no longer apply.
+
+Each search retains its original `.dat`, canonical hits `.csv`, unity profile,
+BLISS log, and a JSON search manifest. Reuse requires matching input and
+executable paths/sizes/modification times, search settings, and a verified
+`.dat` hash. The CSV is regenerated even on reuse; coincidence tables and plots
+are regenerated on every pipeline run. `--force` refits and searches again.
+
+BLISS currently writes 12 data fields under an 11-field `.dat` header. The
+converter uses the actual serialized order, inserting the missing `SEFD` field
+before `SEFD_freq` and naming the last field `Bin_Width` (the upstream header
+calls it `Full_number_of_hits`). `Index` is a fine-channel index **within** its
+coarse channel; plots use the frequency in MHz instead. CSVs have 12 named
+columns with no extra pandas index. Ambiguous legacy CSVs are rejected rather
+than guessed. Regenerate them from their original `.dat` files:
+
+```bash
+python3 -m second_half_pipeline.hits_io old_hits.dat --output repaired_hits.csv
+```
+
+Run the first-half, fitting, parser, and direct-runner regression checks with:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The second call will create a bandpass profile for each tuning file, then chunk and run BLISS, and then plot cross-check across multiple stations, and finally plot "stamps" of each hit matched at multiple stations. This call must include the direct paths to each of the tuning files (up to 4 or 6), along with chosen tolerances for the anti-coincidence test between frequency and drift-rates. The defaults are 10 Hz across and 0.8 Hz/s. These tolerances produce an average of 1 hit matched between two stations per observation. Other arguments can be tweaked, such as the stamp width (number of frequency channels around the hit), chunk size (cut of tuning file that runs through bliss), min_overlap (overlap across chunks that run through bliss), and output directory. This call first looks if there is already an existing bandpass profile for each tuning file, this way re-runs don't have to produce another as the bandpass generation takes ~10 minutes per tuning file. 
-
-Second call example: \
- `python3 second_half_pipeline/run_pipeline.py` \
- `    frb_set_two/059613_002172869-LWA-SV_tun1.h5 frb_set_two/059613_002172869-LWA-SV_tun2.h5` \
-`     frb_set_two/059613_002567249-LWA1_tun1.h5   frb_set_two/059613_002567249-LWA1_tun1.h5` \
-`     --freq_tol 10 --drift_tol 0.8 --width 524 --outdir results_frb_set_three`
+The direct-runner tests use a fake BLISS executable to exercise orchestration,
+caching, and downstream plotting. Scientific detection performance should be
+checked with the installed BLISS build on the compute cluster.
 
 ## Usage on older data
 While this codebase has been tested on both old and new data, it was created primarily for usage on new data from the LWA. For archival data, patches must be made. Particularly, the lsl package must run on a different version for older data, so a virtual environment should be created. The details of the virtual environment are listed in "venv-legacy-lsl.md". This virtual environment was created specifically for data recorded in 2022 using an lsl version of 3.0.8. Additional or fewer patches may be necessary for archival data of a different era. 

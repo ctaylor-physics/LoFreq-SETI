@@ -143,11 +143,12 @@ def combine_datfiles(filenames, outfile):
     """
     Take all chunk .dat files created by bliss and combine them into a single file
     """
-    # .dat cols
-    cols = ["Top_Hit_#", "Drift_Rate",  "SNR", "Uncorrected_Frequency", "Corrected_Frequency", "Index", "freq_start", "freq_end", "SEFD_freq", "Coarse_Channel_Number", "Full_number_of_hits"]
-    # write concat file
-    full_table = pd.concat([pd.read_csv(file, header=8, sep='\t', names=cols) for file in filenames], ignore_index=True)
-    full_table.to_csv(outfile)
+    if __package__:
+        from .hits_io import read_dat
+    else:
+        from hits_io import read_dat
+    full_table = pd.concat([read_dat(file) for file in filenames], ignore_index=True)
+    full_table.to_csv(outfile, index=False)
     # delete split files
     for f in filenames:
         try:
@@ -170,7 +171,7 @@ def process_file(h5_path, bp_path, outdir, nchan, chunksize, min_overlap):
         if 'bandpass_correction_version' in source['data'].attrs:
             raise ValueError(
                 'This file is already bandpass-corrected. The legacy chunker would '
-                'apply the bandpass twice; use the forthcoming direct coarse-channel runner.'
+                'apply the bandpass twice; use run_bliss.py for direct coarse-channel processing.'
             )
     os.makedirs(outdir, exist_ok=True)
     orig_cwd = os.getcwd()

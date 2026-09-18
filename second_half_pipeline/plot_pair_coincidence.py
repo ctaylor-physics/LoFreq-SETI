@@ -38,41 +38,10 @@ import numpy as np
 import pandas as pd
 
 
-# ── Reused helper (identical logic to plot_bliss_stamps.py) ───────────────────
-from plot_bliss_stamps import make_stamp
-
-
-# ── Matched-CSV loader ──────────────────────────────────────────────────────
-#
-# NOTE: This is intentionally separate from plot_bliss_stamps.load_hits().
-# That loader expects the *raw* bliss hits CSVs, which have a leading pandas
-# index column (12 columns total). The matched CSVs written by
-# anti_coincidence.py are saved with index=False and only the 11
-# expected_data_cols, so we parse those directly here instead.
-MATCHED_COLS = [
-    "index","Drift_Rate", "SNR",
-    "Uncorrected_Frequency", "Corrected_Frequency",
-    "Index", "freq_start", "freq_end",
-    "SEFD_freq", "Coarse_Channel_Number", "channel two", "Full_number_of_hits",
-]
-
-
-def load_matched_hits(csv_path):
-    """Load a matched-hits CSV produced by anti_coincidence.py."""
-    df = pd.read_csv(csv_path, header=0)
-    df.columns = MATCHED_COLS
-    df["hit_num"] = np.arange(1, len(df) + 1)
-
-    corr = df["Corrected_Frequency"].values
-    if corr.size == 0:
-        print(f"Warning: matched CSV '{csv_path}' is empty - skipping")
-        return df
-    if corr.max() < 500:
-        df["_hit_freq_mhz"] = df["Corrected_Frequency"]
-    else:
-        df["_hit_freq_mhz"] = df["Uncorrected_Frequency"]
-
-    return df.reset_index(drop=True)
+if __package__:
+    from .plot_bliss_stamps import make_stamp, load_hits as load_matched_hits
+else:
+    from plot_bliss_stamps import make_stamp, load_hits as load_matched_hits
 
 
 def open_h5(path):
