@@ -240,7 +240,64 @@ The direct-runner tests use a fake BLISS executable to exercise orchestration,
 caching, and downstream plotting. Scientific detection performance should be
 checked with the installed BLISS build on the compute cluster.
 
+## UVFITS correlator output
+
+`uvfits_to_filterbank.py` converts the current LWA correlator UVFITS layout
+(one frequency sample per IF) into BLISS-readable filterbank HDF5. The older
+`test_correlated2hdf5.py` name remains a command-line entry point for it.
+Inspect an input before writing files:
+
+```bash
+python3 uvfits_to_filterbank.py observation.UVF_1 --list
+```
+
+To convert the sample's XX parallel-hand cross-correlation amplitude on one
+baseline, choose its AIPS baseline code. For a first smoke test, select one
+scan and one frequency window:
+
+```bash
+python3 uvfits_to_filterbank.py observation.UVF_1 \
+    --baselines 13108 --polarizations 0 --scans 1 --windows 1 \
+    --outdir correlated_filterbanks
+```
+
+By default the converter processes all baselines, all scans, both frequency
+windows, and polarization index 0. `--polarizations all` includes every
+product, `--measure power` writes squared visibility magnitude instead of the
+default magnitude, and `--force` replaces existing outputs. Invalid or
+nonpositive visibility weights become masked zero samples. Each output also
+stores the original weights, exact MJD timestamps, and frequency centers.
+The FITS Stokes code is retained as metadata: in the sample, polarization 0
+has code `-1` even though its AIPS antenna receptor labels are X/Y. The XX
+interpretation follows that receptor order, is labeled as assumed in the HDF5
+attributes, and should be checked against the correlator's product ordering
+for other files.
+
+For the supplied 40-IF example, the converter produces two 20-channel
+frequency windows per AIPS NX scan. The 3 MHz gap between windows and the
+time gaps between scans cannot be represented by a single uniformly sampled
+filterbank axis. With all three baselines and the default polarization this
+example yields 108 small HDF5 files. Files have the usual `(time, 1,
+frequency)` `data` and `mask` datasets, standard filterbank attributes, and
+provenance attributes. Their values are uncalibrated cross-correlation
+amplitudes, not total-power or flux-calibrated spectra.
+
+The direct BLISS runner accepts these files as one coarse channel each:
+
+```bash
+python3 -m second_half_pipeline.run_bliss \
+    --h5 correlated_filterbanks/observation.UVF_1_bl13108_p0_scan001_band01.h5 \
+    --bliss-executable /path/to/bliss_find_hits --outdir correlated_hits
+```
+
+This path uses a unity equalizer and does not apply the first-half bandpass
+fitter. At one sample per IF, the example has about 842 kHz per channel; a
+filterbank wrapper cannot recover fine spectral resolution or narrowband drift
+information that the UVFITS does not contain. A future multi-frequency-channel
+IF layout is rejected explicitly until its frequency mapping is validated.
+
 ## Usage on older data
+
 While this codebase has been tested on both old and new data, it was created primarily for usage on new data from the LWA. For archival data, patches must be made. Particularly, the lsl package must run on a different version for older data, so a virtual environment should be created. The details of the virtual environment are listed in "venv-legacy-lsl.md". This virtual environment was created specifically for data recorded in 2022 using an lsl version of 3.0.8. Additional or fewer patches may be necessary for archival data of a different era. 
 
 ## Package Dependencies

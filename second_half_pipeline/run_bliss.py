@@ -22,6 +22,29 @@ def search_layout(path):
     with h5py.File(path, 'r') as f:
         if '_bandpass_work' in f:
             raise ValueError('Incomplete bandpass correction; finish the fitter before searching')
+        if 'data' in f and 'uvfits_measure' in f['data'].attrs:
+            if f.attrs.get('CLASS') != 'FILTERBANK' or not {'data', 'mask', 'time_mjd', 'frequency_mhz'} <= set(f):
+                raise ValueError('Incomplete UVFITS filterbank file')
+            ds = f['data']
+            if ds.ndim != 3 or ds.shape[0] < 2 or ds.shape[1] != 1 or ds.shape[2] < 3:
+                raise ValueError('Expected UVFITS filterbank data shaped (time >= 2, 1, frequency >= 3)')
+            n = ds.shape[2]
+            if f['mask'].shape != ds.shape or f['time_mjd'].shape != (ds.shape[0],) or f['frequency_mhz'].shape != (n,):
+                raise ValueError('UVFITS filterbank axes do not match data')
+            if (ds.attrs.get('nchans') != n or ds.attrs.get('nifs') != 1
+                    or ds.attrs.get('uvfits_measure') not in ('amplitude', 'power')):
+                raise ValueError('Invalid UVFITS filterbank metadata')
+            if 'bandpass_correction_version' in ds.attrs or 'uncorrected' in f:
+                raise ValueError('Ambiguous UVFITS bandpass correction state')
+            for key in ('fch1', 'foff', 'tsamp', 'tstart'):
+                if key not in ds.attrs or not np.isfinite(ds.attrs[key]):
+                    raise ValueError(f'Missing or invalid {key}')
+            if ds.attrs['foff'] <= 0 or ds.attrs['tsamp'] <= 0:
+                raise ValueError('UVFITS frequency and time steps must be positive')
+            frequencies = f['frequency_mhz'][:]
+            if not np.allclose(frequencies, ds.attrs['fch1'] + np.arange(n) * ds.attrs['foff'], rtol=0, atol=1e-7):
+                raise ValueError('UVFITS frequency axis is not described by fch1/foff')
+            return {'fine_channels_per_coarse': n, 'first_coarse': 0, 'number_coarse': 1}
         if not {'data', 'mask', 'uncorrected', 'bandpass_model'} <= set(f):
             raise ValueError('Run the updated bandpass fitter before searching')
         ds = f['data']
