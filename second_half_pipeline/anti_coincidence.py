@@ -50,20 +50,11 @@ if len(stations) < 2:
 freq_tolerance  = args.freq_tol  / 1e6   # convert Hz → MHz to match the CSV column units
 drift_tolerance     = args.drift_tol          # Hz/s, matches Drift_Rate column directly
 
-# --- load CSVs ------------------------
-expected_data_cols = [
-        "index", "Drift_Rate", "SNR",
-        "Uncorrected_Frequency", "Corrected_Frequency",
-        "Index", "freq_start", "freq_end",
-        "SEFD_freq", "Coarse_Channel_Number","channel two", "Full_number_of_hits",
-    ]
-
-
-# read in all of the csv files as dataframes and adjust the columns as necessary
-def load_hits(path): 
-    df = pd.read_csv(path)
-    df.columns = expected_data_cols
-    return df
+# Correctly labeled CSVs only: positional renaming hid the old .dat mismatch.
+if __package__:
+    from .hits_io import read_hits_csv as load_hits
+else:
+    from hits_io import read_hits_csv as load_hits
 
 # load only the stations that were actually passed in
 data = {name: load_hits(path) for name, path in stations.items()}
@@ -93,9 +84,9 @@ def check_between_two_stations(station_1_data, station_2_data, freq_tol, drift_t
     Returns
     -------
     matched_s1 : pd.DataFrame
-        Rows from station_1_data that have at least one match in station_2_data.
+        One row per matching pair, aligned with matched_s2 (repeats allowed).
     matched_s2 : pd.DataFrame
-        Rows from station_2_data that have at least one match in station_1_data.
+        One row per matching pair, aligned with matched_s1 (repeats allowed).
     '''
     # Pull out numpy arrays for fast vectorised comparison
     freq1  = station_1_data['Corrected_Frequency'].to_numpy()   # MHz
@@ -111,13 +102,11 @@ def check_between_two_stations(station_1_data, station_2_data, freq_tol, drift_t
 
     both_match = freq_match & drift_match   # (len_s1, len_s2) bool array
  
-    # A station-1 row matches if ANY station-2 row satisfies both conditions
-    s1_has_match = both_match.any(axis=1)   # shape (len_s1,)
-    s2_has_match = both_match.any(axis=0)   # shape (len_s2,)
- 
-    matched_s1 = station_1_data[s1_has_match].reset_index(drop=True)
-    matched_s2 = station_2_data[s2_has_match].reset_index(drop=True)
- 
+    # Emit every matching pair in aligned order (including one-to-many matches).
+    row1, row2 = np.nonzero(both_match)
+    matched_s1 = station_1_data.iloc[row1].reset_index(drop=True)
+    matched_s2 = station_2_data.iloc[row2].reset_index(drop=True)
+
     return matched_s1, matched_s2
 
 # ---- Match hits between stations and make sure all indices align --------
@@ -154,9 +143,9 @@ def match_triple_coincidence(data_na, data_sv, data_one, freq_tol, drift_tol):
                 rows_sv.append(data_sv.iloc[j])
                 rows_one.append(data_one.iloc[k])
 
-    all_three_na  = pd.DataFrame(rows_na).reset_index(drop=True)
-    all_three_sv  = pd.DataFrame(rows_sv).reset_index(drop=True)
-    all_three_one = pd.DataFrame(rows_one).reset_index(drop=True)
+    all_three_na  = pd.DataFrame(rows_na, columns=data_na.columns).reset_index(drop=True)
+    all_three_sv  = pd.DataFrame(rows_sv, columns=data_sv.columns).reset_index(drop=True)
+    all_three_one = pd.DataFrame(rows_one, columns=data_one.columns).reset_index(drop=True)
 
     return all_three_na, all_three_sv, all_three_one
 
